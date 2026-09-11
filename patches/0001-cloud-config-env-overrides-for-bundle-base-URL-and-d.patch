@@ -1,0 +1,214 @@
+From e265cd777c0b6e7dc62fa97c6146be29ef98f9fb Mon Sep 17 00:00:00 2001
+From: marvinli00 <marvinli0327@gmail.com>
+Date: Fri, 11 Sep 2026 11:30:21 -0700
+Subject: [PATCH] cloud-config: env overrides for bundle base URL and disabling
+ fetch
+
+Add two environment variables read only by the cloud config bundle loader:
+
+- CODEX_CLOUD_CONFIG_BASE_URL_OVERRIDE: base URL used for the bundle
+  request instead of chatgpt_base_url. Other ChatGPT backend traffic is
+  unaffected.
+- CODEX_CLOUD_CONFIG_DISABLED=1|true: skip the bundle fetch entirely and
+  apply no workspace-managed config or requirements (rollout kill switch).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RTzRQNC4dSSKtEWxNhw7mH
+---
+ codex-rs/cloud-config/src/bundle_loader.rs    | 83 ++++++++++++++++++-
+ .../cloud-config/src/bundle_loader_tests.rs   | 55 ++++++++++++
+ 2 files changed, 134 insertions(+), 4 deletions(-)
+ create mode 100644 codex-rs/cloud-config/src/bundle_loader_tests.rs
+
+diff --git a/codex-rs/cloud-config/src/bundle_loader.rs b/codex-rs/cloud-config/src/bundle_loader.rs
+index d38355189f..287131b005 100644
+--- a/codex-rs/cloud-config/src/bundle_loader.rs
++++ b/codex-rs/cloud-config/src/bundle_loader.rs
+@@ -13,6 +13,70 @@ use std::sync::OnceLock;
+ use tokio::task::AbortHandle;
+ use tokio::task::JoinHandle;
+ 
++/// Overrides the base URL used to fetch the cloud config bundle.
++///
++/// Only bundle requests honor this variable; every other ChatGPT backend
++/// request keeps using the configured `chatgpt_base_url`.
++pub(crate) const CLOUD_CONFIG_BASE_URL_OVERRIDE_ENV_VAR: &str =
++    "CODEX_CLOUD_CONFIG_BASE_URL_OVERRIDE";
++
++const DEFAULT_CLOUD_CONFIG_BASE_URL: &str = "https://chatgpt.com/backend-api/";
++
++/// Resolves the base URL for cloud config bundle requests.
++///
++/// A non-blank override wins. Otherwise the configured ChatGPT base URL is
++/// used, falling back to the production ChatGPT backend.
++fn bundle_base_url_from(
++    override_value: Option<String>,
++    chatgpt_base_url: Option<String>,
++) -> String {
++    override_value
++        .map(|value| value.trim().to_string())
++        .filter(|value| !value.is_empty())
++        .or(chatgpt_base_url)
++        .unwrap_or_else(|| DEFAULT_CLOUD_CONFIG_BASE_URL.to_string())
++}
++
++fn bundle_base_url(chatgpt_base_url: Option<String>) -> String {
++    let override_value = std::env::var(CLOUD_CONFIG_BASE_URL_OVERRIDE_ENV_VAR).ok();
++    let override_active = override_value
++        .as_deref()
++        .is_some_and(|value| !value.trim().is_empty());
++    let base_url = bundle_base_url_from(override_value, chatgpt_base_url);
++    if override_active {
++        tracing::info!(
++            base_url = %base_url,
++            "Using cloud config bundle base URL override from {CLOUD_CONFIG_BASE_URL_OVERRIDE_ENV_VAR}"
++        );
++    }
++    base_url
++}
++
++/// Disables cloud config bundle fetching entirely when set to `1` or `true`.
++///
++/// Intended for rollout testing: startup skips the bundle request, ignores any
++/// cached bundle, and applies no workspace-managed config or requirements.
++pub(crate) const CLOUD_CONFIG_DISABLED_ENV_VAR: &str = "CODEX_CLOUD_CONFIG_DISABLED";
++
++/// Returns whether a `CODEX_CLOUD_CONFIG_DISABLED` value disables bundle fetching.
++fn cloud_config_bundle_disabled_from(value: Option<String>) -> bool {
++    value
++        .as_deref()
++        .map(|value| value.trim().to_ascii_lowercase())
++        .is_some_and(|value| matches!(value.as_str(), "1" | "true"))
++}
++
++fn cloud_config_bundle_disabled() -> bool {
++    let disabled =
++        cloud_config_bundle_disabled_from(std::env::var(CLOUD_CONFIG_DISABLED_ENV_VAR).ok());
++    if disabled {
++        tracing::warn!(
++            "Cloud config bundle fetching is disabled by {CLOUD_CONFIG_DISABLED_ENV_VAR}; workspace-managed config and requirements will not be applied"
++        );
++    }
++    disabled
++}
++
+ fn refresher_task_slot() -> &'static Mutex<Option<AbortHandle>> {
+     static REFRESHER_TASK: OnceLock<Mutex<Option<AbortHandle>>> = OnceLock::new();
+     REFRESHER_TASK.get_or_init(|| Mutex::new(None))
+@@ -45,10 +109,13 @@ pub fn cloud_config_bundle_loader(
+     codex_home: PathBuf,
+     http_client_factory: HttpClientFactory,
+ ) -> CloudConfigBundleLoader {
++    if cloud_config_bundle_disabled() {
++        return CloudConfigBundleLoader::default();
++    }
+     let service = CloudConfigBundleService::new(
+         auth_manager,
+         Arc::new(BackendBundleClient::new(
+-            chatgpt_base_url,
++            bundle_base_url(Some(chatgpt_base_url)),
+             http_client_factory,
+         )),
+         codex_home,
+@@ -88,6 +155,9 @@ pub async fn cloud_config_bundle_loader_for_storage(
+     auth_config: AuthConfig,
+     enable_codex_api_key_env: bool,
+ ) -> std::io::Result<CloudConfigBundleLoader> {
++    if cloud_config_bundle_disabled() {
++        return Ok(CloudConfigBundleLoader::default());
++    }
+     let service =
+         cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env).await?;
+     let (loader, refresh_task) = cloud_config_bundle_loader_for_service(service);
+@@ -101,6 +171,9 @@ pub async fn cloud_config_bundle_loader_for_storage_without_cache(
+     auth_config: AuthConfig,
+     enable_codex_api_key_env: bool,
+ ) -> std::io::Result<CloudConfigBundleLoader> {
++    if cloud_config_bundle_disabled() {
++        return Ok(CloudConfigBundleLoader::default());
++    }
+     let service = Arc::new(
+         cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env)
+             .await?
+@@ -121,12 +194,14 @@ async fn cloud_config_bundle_service_for_storage(
+     Ok(CloudConfigBundleService::new(
+         auth_manager,
+         Arc::new(BackendBundleClient::new(
+-            auth_config
+-                .chatgpt_base_url
+-                .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string()),
++            bundle_base_url(auth_config.chatgpt_base_url),
+             auth_config.auth_route_config.http_client_factory().clone(),
+         )),
+         auth_config.codex_home,
+         CLOUD_CONFIG_BUNDLE_TIMEOUT,
+     ))
+ }
++
++#[cfg(test)]
++#[path = "bundle_loader_tests.rs"]
++mod tests;
+diff --git a/codex-rs/cloud-config/src/bundle_loader_tests.rs b/codex-rs/cloud-config/src/bundle_loader_tests.rs
+new file mode 100644
+index 0000000000..6c19d7a817
+--- /dev/null
++++ b/codex-rs/cloud-config/src/bundle_loader_tests.rs
+@@ -0,0 +1,55 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++const OVERRIDE_URL: &str = "https://codex-policy.example/backend-api/";
++const CONFIGURED_URL: &str = "https://chatgpt.example/backend-api/";
++
++#[test]
++fn override_wins_over_configured_chatgpt_base_url() {
++    assert_eq!(
++        bundle_base_url_from(
++            Some(OVERRIDE_URL.to_string()),
++            Some(CONFIGURED_URL.to_string())
++        ),
++        OVERRIDE_URL
++    );
++}
++
++#[test]
++fn override_is_trimmed() {
++    assert_eq!(
++        bundle_base_url_from(Some(format!("  {OVERRIDE_URL}\n")), None),
++        OVERRIDE_URL
++    );
++}
++
++#[test]
++fn blank_override_falls_back_to_configured_chatgpt_base_url() {
++    assert_eq!(
++        bundle_base_url_from(Some("   ".to_string()), Some(CONFIGURED_URL.to_string())),
++        CONFIGURED_URL
++    );
++}
++
++#[test]
++fn missing_override_and_config_fall_back_to_production_backend() {
++    assert_eq!(
++        bundle_base_url_from(/*override_value*/ None, /*chatgpt_base_url*/ None),
++        "https://chatgpt.com/backend-api/"
++    );
++}
++
++#[test]
++fn disabled_flag_accepts_one_and_true_case_insensitively() {
++    let values = ["1", "true", " TRUE ", "0", "false", "yes", ""];
++    let actual: Vec<bool> = values
++        .iter()
++        .map(|value| cloud_config_bundle_disabled_from(Some((*value).to_string())))
++        .collect();
++    assert_eq!(actual, vec![true, true, true, false, false, false, false]);
++}
++
++#[test]
++fn disabled_flag_is_off_when_unset() {
++    assert!(!cloud_config_bundle_disabled_from(/*value*/ None));
++}
+-- 
+2.50.1 (Apple Git-155)
+

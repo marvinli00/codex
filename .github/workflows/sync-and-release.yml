@@ -1,0 +1,199 @@
+name: test_config sync and release
+
+# Daily: find the latest upstream openai/codex release tag, apply patches/*.patch,
+# build the macOS arm64 binary, and publish it as a GitHub Release of this fork.
+# The version is inherited from the upstream tag (its Cargo.toml already carries it).
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC daily
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to build (e.g. rust-v0.154.0). Empty = latest stable."
+        required: false
+        default: ""
+      include_prerelease:
+        description: "Allow alpha/beta tags when picking the latest tag"
+        type: boolean
+        default: false
+      force:
+        description: "Rebuild even if a release for this version already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: test_config-sync-and-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: openai/codex
+  RELEASE_TAG_PREFIX: test_config-v
+  TARGET: aarch64-apple-darwin
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.pick.outputs.upstream_tag }}
+      version: ${{ steps.pick.outputs.version }}
+      release_tag: ${{ steps.pick.outputs.release_tag }}
+      prerelease: ${{ steps.pick.outputs.prerelease }}
+      skip: ${{ steps.pick.outputs.skip }}
+    steps:
+      - name: Pick upstream tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.upstream_tag }}
+          INCLUDE_PRERELEASE: ${{ github.event.inputs.include_prerelease }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_TAG}" ]]; then
+            tag="${INPUT_TAG}"
+          else
+            if [[ "${INCLUDE_PRERELEASE}" == "true" ]]; then
+              pattern='^rust-v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)(\.[0-9]+)*)?$'
+            else
+              pattern='^rust-v[0-9]+\.[0-9]+\.[0-9]+$'
+            fi
+            tag="$(git ls-remote --tags --refs "https://github.com/${UPSTREAM_REPO}.git" \
+              | awk '{print $2}' | sed 's#refs/tags/##' | grep -E "${pattern}" | sort -V | tail -n1)"
+          fi
+          [[ -n "${tag}" ]] || { echo "no upstream tag found"; exit 1; }
+          version="${tag#rust-v}"
+          release_tag="${RELEASE_TAG_PREFIX}${version}"
+          prerelease=false
+          [[ "${version}" == *-* ]] && prerelease=true
+          skip=false
+          if [[ "${FORCE}" != "true" ]] && gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            skip=true
+          fi
+          {
+            echo "upstream_tag=${tag}"
+            echo "version=${version}"
+            echo "release_tag=${release_tag}"
+            echo "prerelease=${prerelease}"
+            echo "skip=${skip}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "upstream=${tag} version=${version} release=${release_tag} prerelease=${prerelease} skip=${skip}"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    # Standard GitHub macOS arm64 runner (M-series, 3 vCPU, 7 GB). If the final
+    # thin-LTO link gets OOM-killed, uncomment CARGO_PROFILE_RELEASE_LTO below or
+    # switch to a larger runner such as macos-15-xlarge.
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+      CARGO_INCREMENTAL: "0"
+      # CARGO_PROFILE_RELEASE_LTO: "off"
+    steps:
+      - name: Check out tooling branch
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+
+      - name: Check out upstream source at tag
+        uses: actions/checkout@v4
+        with:
+          repository: openai/codex
+          ref: ${{ env.UPSTREAM_TAG }}
+          path: src
+          fetch-depth: 0
+
+      - name: Apply patches
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git config user.name "test_config bot"
+          git config user.email "test_config-bot@users.noreply.github.com"
+          patches=(../tooling/patches/*.patch)
+          git am --3way "${patches[@]}"
+          git log --oneline -n "${#patches[@]}"
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        working-directory: src/codex-rs
+        run: |
+          set -euo pipefail
+          channel="$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          rustup toolchain install "${channel}" --profile minimal
+          rustup target add --toolchain "${channel}" "${TARGET}"
+          cargo --version
+
+      - name: Build codex (release)
+        working-directory: src/codex-rs
+        run: |
+          set -euo pipefail
+          export STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
+          cargo build --release --target "${TARGET}" --bin codex
+
+      - name: Verify inherited version and patch
+        working-directory: src/codex-rs
+        run: |
+          set -euo pipefail
+          bin="target/${TARGET}/release/codex"
+          actual="$("${bin}" --version | awk '{print $2}')"
+          [[ "${actual}" == "${VERSION}" ]] || { echo "version mismatch: ${actual} != ${VERSION}"; exit 1; }
+          strings "${bin}" | grep -q CODEX_CLOUD_CONFIG_BASE_URL_OVERRIDE
+          strings "${bin}" | grep -q CODEX_CLOUD_CONFIG_DISABLED
+          echo "codex ${actual} contains the test_config patches"
+
+      - name: Package
+        working-directory: src/codex-rs
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${TARGET}/release/codex" "dist/codex-${TARGET}"
+          strip -x "dist/codex-${TARGET}"
+          tar -C dist -czf "dist/codex-${TARGET}.tar.gz" "codex-${TARGET}"
+          (cd dist && shasum -a 256 "codex-${TARGET}.tar.gz" > "codex-${TARGET}.tar.gz.sha256")
+          ls -lh dist
+
+      - name: Push patched source and tag to this fork
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force fork "HEAD:refs/heads/release/${RELEASE_TAG}"
+          git tag -f "${RELEASE_TAG}"
+          git push --force fork "refs/tags/${RELEASE_TAG}"
+
+      - name: Create or update GitHub release
+        working-directory: src/codex-rs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="Built from upstream ${UPSTREAM_TAG} (https://github.com/${UPSTREAM_REPO}/releases/tag/${UPSTREAM_TAG}) with the patches in the test_config branch applied. Source: branch release/${RELEASE_TAG}."
+          assets=("dist/codex-${TARGET}.tar.gz" "dist/codex-${TARGET}.tar.gz.sha256")
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${assets[@]}"
+          else
+            flags=()
+            [[ "${PRERELEASE}" == "true" ]] && flags+=(--prerelease)
+            gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag \
+              --title "codex ${VERSION} (test_config)" --notes "${notes}" "${flags[@]}" "${assets[@]}"
+          fi
+
+      - name: Open an issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "test_config build failed for ${UPSTREAM_TAG}" \
+            --body "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          Check whether patches/*.patch still apply cleanly to ${UPSTREAM_TAG} (git am --3way) and whether the build passed."
