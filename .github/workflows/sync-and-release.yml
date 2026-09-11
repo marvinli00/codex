@@ -135,7 +135,8 @@ jobs:
         working-directory: src/codex-rs
         run: |
           set -euo pipefail
-          export STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
+          STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
+          export STABLE_GIT_COMMIT
           cargo build --release --target "${TARGET}" --bin codex
 
       - name: Verify inherited version and patch
